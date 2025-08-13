@@ -2,14 +2,18 @@ import asyncio
 import json
 import time
 import uuid
+import os
 from typing import AsyncGenerator
 
-from fastapi import FastAPI, Response
+import torch
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from myserve.api.openai_types import ChatCompletionRequest
 from myserve.core.tokenizer import get_tokenizer, render_messages
+from myserve.core.models import REGISTRY
+from myserve.core.generate import greedy_generate
 
 app = FastAPI(title="myserve")
 app.add_middleware(
@@ -24,91 +28,124 @@ app.add_middleware(
 def healthz():
     return {"status": "ok"}
 
+USE_ECHO_FALLBACK = os.getenv("MYSERVE_FORCE_ECHO", "0") == "1"
+DEFAULT_DTYPE = os.getenv("MYSERVE_DTYPE", "auto")
+DEFAULT_DEVICE = os.getenv("MYSERVE_DEVICE", "auto")
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
-    # Build the prompt from chat messages
-    prompt = render_messages(req.messages)
-    tokenizer = get_tokenizer(req.model)
-
-    # Token-echo: turn the *prompt tokens* into the assistant's output tokens
-    input_ids = tokenizer.encode(prompt, add_special_tokens=False)
-
-    # Respect max_tokens by truncating the echo
-    max_toks = max(0, int(req.max_tokens or 0))
-    if max_toks:
-        output_ids = input_ids[:max_toks]
-    else:
-        # default: cap to 128 to avoid huge responses if user pasted a novel
-        output_ids = input_ids[:128]
+    model_name = req.model
+    tokenizer = get_tokenizer(model_name)
+    prompt = render_messages(tokenizer, req.messages)
 
     created = int(time.time())
-    model_name = req.model
     rid = f"chatcmpl_{uuid.uuid4().hex[:24]}"
 
+    # Try to load a real model unless echo is forced
+    bundle = None
+    if not USE_ECHO_FALLBACK:
+        try:
+            bundle = REGISTRY.load(model_name, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE)
+        except Exception as e:
+            # fallback silently to echo mode; in real servers you would surface a 400
+            bundle = None
+
+    if bundle is None:
+        # --- Echo backend (Post 1) ---
+        input_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        max_new = max(0, int(req.max_tokens or 0)) or 128
+        output_ids = input_ids[:max_new]
+
+        if req.stream:
+            async def echo_stream() -> AsyncGenerator[bytes, None]:
+                yield _sse_chunk(rid, model_name, role="assistant")
+                for tid in output_ids:
+                    piece = tokenizer.decode([tid], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                    if piece:
+                        yield _sse_chunk(rid, model_name, content=piece)
+                    await asyncio.sleep(0.0)
+                yield _sse_done(rid, model_name)
+            return StreamingResponse(echo_stream(), media_type="text/event-stream")
+
+        text = tokenizer.decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        return JSONResponse(_non_stream_payload(rid, model_name, text))
+
+    # --- Real model backend (this post) ---
+    tok = bundle.tokenizer
+    eos = tok.eos_token_id
+
+    enc = tok(prompt, return_tensors="pt", add_special_tokens=False)
+    input_ids = enc["input_ids"].to(bundle.device)
+
+    max_new = max(1, int(req.max_tokens or 16))
+
     if req.stream:
-        async def event_stream() -> AsyncGenerator[bytes, None]:
-            # first chunk has the role field
-            preamble = {
-                "id": rid,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_name,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"role": "assistant"},
-                    "finish_reason": None,
-                }],
-            }
-            yield f"data: {json.dumps(preamble, ensure_ascii=False)}\n\n".encode()
-
-            # stream token-by-token as delta.content
-            for tid in output_ids:
-                piece = tokenizer.decode([tid], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                if piece == "":
-                    continue
-                chunk = {
-                    "id": rid,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model_name,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": piece},
-                        "finish_reason": None,
-                    }],
-                }
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
-                # tiny delay to make streaming visible in demos
+        async def model_stream() -> AsyncGenerator[bytes, None]:
+            yield _sse_chunk(rid, model_name, role="assistant")
+            # We decode token-by-token to stream pieces.
+            generated = input_ids
+            for i in range(max_new):
+                with torch.no_grad():
+                    logits = bundle.model(generated).logits
+                    next_id = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+                generated = torch.cat([generated, next_id], dim=1)
+                piece = tok.decode(next_id[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                if piece:
+                    yield _sse_chunk(rid, model_name, content=piece)
+                if eos is not None and int(next_id.item()) == eos:
+                    break
                 await asyncio.sleep(0.0)
+            yield _sse_done(rid, model_name)
+        return StreamingResponse(model_stream(), media_type="text/event-stream")
 
-            # finalizer chunk
-            final = {
-                "id": rid,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_name,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop",
-                }],
-            }
-            yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n".encode()
-            yield b"data: [DONE]\n\n"
+    # Non‑stream: run the simple greedy helper for clarity
+    out = greedy_generate(bundle.model, input_ids, max_new_tokens=max_new, eos_token_id=eos)
+    new_tokens = out[0, input_ids.size(1):]
+    text = tok.decode(new_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    return JSONResponse(_non_stream_payload(rid, model_name, text))
 
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
+# helpers ------------------------------------------------------------
 
-    # Non-streaming: assemble the whole string
-    text = tokenizer.decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    payload = {
+def _sse_chunk(rid: str, model: str, content: str | None = None, role: str | None = None) -> bytes:
+    delta = {}
+    if role is not None:
+        delta["role"] = role
+    if content:
+        delta["content"] = content
+    obj = {
+        "id": rid,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": None,
+        }],
+    }
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode()
+
+
+def _sse_done(rid: str, model: str) -> bytes:
+    obj = {
+        "id": rid,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+    return (f"data: {json.dumps(obj, ensure_ascii=False)}\n\n" + "data: [DONE]\n\n").encode()
+
+
+def _non_stream_payload(rid: str, model: str, text: str) -> dict:
+    return {
         "id": rid,
         "object": "chat.completion",
-        "created": created,
-        "model": model_name,
+        "created": int(time.time()),
+        "model": model,
         "choices": [{
             "index": 0,
             "message": {"role": "assistant", "content": text},
             "finish_reason": "stop",
         }],
     }
-    return JSONResponse(payload)
