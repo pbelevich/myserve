@@ -10,16 +10,21 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
-    stream: Optional[bool] = False
-    max_tokens: Optional[int] = 256
+    # sampling
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
+    top_k: Optional[int] = None           # OpenAI doesn’t expose top_k, but we support it
     n: Optional[int] = 1
-    stop: Optional[list[str]] = None
+    max_tokens: Optional[int] = 256
+    seed: Optional[int] = None            # not in OpenAI; helpful for tests
+    # penalties (OpenAI compatible semantics)
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
+    # logprobs
     logprobs: Optional[bool] = False
-    top_logprobs: Optional[int] = None
+    top_logprobs: Optional[int] = 0       # 0 → only chosen token
+    # streaming
+    stream: Optional[bool] = False
     user: Optional[str] = None
 
     model_config = ConfigDict(extra="ignore")
