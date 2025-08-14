@@ -14,8 +14,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from myserve.api.openai_types import ChatCompletionRequest
 from myserve.core.tokenizer import get_tokenizer, render_messages
 from myserve.core.models import REGISTRY
-from myserve.core.generate import sample_generate
+from myserve.core.generate import cached_generate
 from myserve.core.sampling import SamplerCfg, sample_next
+from myserve.core.engine import prefill, decode_step
 
 
 app = FastAPI(title="myserve")
@@ -100,11 +101,13 @@ async def chat_completions(req: ChatCompletionRequest):
         async def stream() -> AsyncGenerator[bytes, None]:
             yield _sse_chunk(rid, model_name, role="assistant")
             generated = input_ids
+            # prefill once
+            logits, kv = prefill(bundle.model, input_ids)
             for _ in range(max_new):
-                logits = bundle.model(generated).logits[:, -1, :]
                 next_ids, chosen_lp, logprobs = sample_next(logits, cfg, generated, gen)
                 generated = torch.cat([generated, next_ids.unsqueeze(1)], dim=1)
                 piece = tok.decode(next_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                # emit SSE chunk (with optional logprobs)
                 extra = None
                 if req.logprobs:
                     k = int(req.top_logprobs or 0)
@@ -122,12 +125,14 @@ async def chat_completions(req: ChatCompletionRequest):
                 yield _sse_chunk(rid, model_name, content=piece, extra=extra)
                 if eos is not None and int(next_ids[0]) == eos:
                     break
+                # fast decode step
+                logits, kv = decode_step(bundle.model, next_ids.view(1,1), kv)
                 await asyncio.sleep(0.0)
             yield _sse_done(rid, model_name)
         return StreamingResponse(stream(), media_type="text/event-stream")
 
-    # non‑stream
-    all_ids, per_step = sample_generate(
+    # in non‑stream path
+    all_ids, per_step = cached_generate(
         bundle.model, input_ids, max_new_tokens=max_new, eos_token_id=eos,
         cfg=cfg, gen=gen, collect_logprobs=bool(req.logprobs)
     )
