@@ -3,6 +3,7 @@ from typing import Optional
 import torch
 from torch import nn
 from .sampling import SamplerCfg, sample_next
+from .engine import prefill, decode_step
 
 @torch.no_grad()
 def greedy_generate(
@@ -64,3 +65,42 @@ def sample_generate(
         if eos_token_id is not None and torch.all(next_ids == eos_token_id):
             break
     return out, per_step
+
+@torch.no_grad()
+def cached_generate(
+    model: nn.Module,
+    input_ids: torch.LongTensor,          # [B,T]
+    max_new_tokens: int,
+    eos_token_id: Optional[int],
+    cfg: SamplerCfg,                      # from Post 3
+    gen: Optional[torch.Generator] = None,
+    collect_logprobs: bool = False,
+):
+    B = input_ids.size(0)
+    # 1) Prefill
+    logits, kv = prefill(model, input_ids)
+    generated = input_ids
+    per_step = []
+
+    for _ in range(max_new_tokens):
+        # sample next token from current logits
+        next_ids, chosen_lp, logprobs = sample_next(logits, cfg, generated, gen)
+        generated = torch.cat([generated, next_ids.unsqueeze(1)], dim=1)
+        if collect_logprobs:
+            step = []
+            k = int(cfg.top_logprobs or 0)
+            for b in range(B):
+                item = {"id": int(next_ids[b]), "logprob": float(chosen_lp[b])}
+                if k > 0:
+                    topv, topi = torch.topk(torch.log_softmax(logits[b], dim=-1), k)
+                    item["top_logprobs"] = [(int(topi[j]), float(topv[j])) for j in range(k)]
+                step.append(item)
+            per_step.append(step)
+        # early stop if everyone hit EOS
+        if eos_token_id is not None and torch.all(next_ids == eos_token_id):
+            break
+        # 2) Decode step – feed just last token with KV
+        last = next_ids.view(B, 1)
+        logits, kv = decode_step(model, last, kv)
+
+    return generated, per_step
