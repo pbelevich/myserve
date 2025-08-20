@@ -9,6 +9,7 @@ description = "OpenAI-compatible My Inference Server"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "accelerate",
   "fastapi>=0.111",
   "uvicorn[standard]>=0.30",
   "pydantic>=2.6",
@@ -19,7 +20,9 @@ dependencies = [
   "pytest>=8.2",         # tests
   "pytest-asyncio>=0.23", # tests async
   "torch>=2.2",
-  "openai>=1,<2"
+  "openai>=1,<2",
+  "asgi-lifespan",
+  "prometheus-client>=0.20"
 ]
 
 [tool.pytest.ini_options]

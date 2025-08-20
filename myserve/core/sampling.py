@@ -71,13 +71,18 @@ def sample_next(
     # penalties first (operate in logits space)
     logits = apply_penalties(logits, generated_ids, cfg.presence_penalty, cfg.frequency_penalty)
     # temperature
-    temperature = max(1e-5, float(cfg.temperature))
-    logits = logits / temperature
-    # filter and normalize
-    logits = top_k_top_p_filter(logits, cfg.top_k, cfg.top_p)
-    logprobs = F.log_softmax(logits, dim=-1)
-    probs = torch.exp(logprobs)
-    # sample
-    next_ids = torch.multinomial(probs, num_samples=1, generator=gen)  # [B,1]
+    if cfg.temperature != 0.0:
+        temperature = max(1e-5, float(cfg.temperature))
+        logits = logits / temperature
+        # filter and normalize
+        logits = top_k_top_p_filter(logits, cfg.top_k, cfg.top_p)
+        logprobs = F.log_softmax(logits, dim=-1)
+        probs = torch.exp(logprobs)
+        # sample
+        next_ids = torch.multinomial(probs, num_samples=1, generator=gen)  # [B,1]
+    else:
+        logprobs = torch.full_like(logits, -float('inf'), dtype=logits.dtype)
+        logprobs[torch.arange(logits.shape[0]), logits.argmax(dim=-1)] = 0.0
+        next_ids = torch.argmax(logits, dim=-1).unsqueeze(-1) # greedy decoding
     chosen_logprobs = logprobs.gather(-1, next_ids)                    # [B,1]
     return next_ids.squeeze(-1), chosen_logprobs.squeeze(-1), logprobs

@@ -28,7 +28,7 @@ class ModelRegistry:
         
         # Resolve dtype
         if dtype == "auto":
-            torch_dtype = None  # let HF pick
+            torch_dtype = "auto"  # let HF pick
         elif dtype.lower() in ("bf16", "bfloat16"):
             torch_dtype = torch.bfloat16
         elif dtype.lower() in ("fp16", "float16"):

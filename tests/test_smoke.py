@@ -1,10 +1,17 @@
 import pytest
 from httpx import AsyncClient, ASGITransport
+from asgi_lifespan import LifespanManager
 from myserve.main import app
 
+@pytest.fixture()
+async def started_app():
+    # Starts FastAPI lifespan (startup) before tests and runs shutdown after
+    async with LifespanManager(app):
+        yield app
+
 @pytest.mark.asyncio
-async def test_non_stream_basic():
-    transport = ASGITransport(app=app)
+async def test_non_stream_basic(started_app):
+    transport = ASGITransport(app=started_app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         body = {
             "model": "gpt2",
@@ -22,8 +29,8 @@ async def test_non_stream_basic():
         assert isinstance(data["choices"][0]["message"]["content"], str)
 
 @pytest.mark.asyncio
-async def test_streaming_basic_sse():
-    transport = ASGITransport(app=app)
+async def test_streaming_basic_sse(started_app):
+    transport = ASGITransport(app=started_app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         body = {
             "model": "gpt2",

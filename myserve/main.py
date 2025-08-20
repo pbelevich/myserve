@@ -1,6 +1,5 @@
 import asyncio
 import json
-import math
 import time
 import uuid
 import os
@@ -9,17 +8,29 @@ from typing import AsyncGenerator
 import torch
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
 
 from myserve.api.openai_types import ChatCompletionRequest
 from myserve.core.tokenizer import get_tokenizer, render_messages
 from myserve.core.models import REGISTRY
-from myserve.core.generate import cached_generate
-from myserve.core.sampling import SamplerCfg, sample_next
-from myserve.core.engine import prefill, decode_step
+from myserve.core.sampling import SamplerCfg
+from myserve.scheduler import Scheduler, GenRequest
+from contextlib import asynccontextmanager
 
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
-app = FastAPI(title="myserve")
+SCHED = Scheduler()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # startup
+    await SCHED.start()
+    try:
+        yield
+    finally:
+        await SCHED.stop()
+
+app = FastAPI(title="myserve", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,6 +43,10 @@ app.add_middleware(
 def healthz():
     return {"status": "ok"}
 
+@app.get("/metrics")
+def metrics():
+    return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 USE_ECHO_FALLBACK = os.getenv("MYSERVE_FORCE_ECHO", "0") == "1"
 DEFAULT_DTYPE = os.getenv("MYSERVE_DTYPE", "auto")
 DEFAULT_DEVICE = os.getenv("MYSERVE_DEVICE", "auto")
@@ -39,10 +54,6 @@ DEFAULT_DEVICE = os.getenv("MYSERVE_DEVICE", "auto")
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
     model_name = req.model
-    tokenizer = get_tokenizer(model_name)
-    prompt = render_messages(tokenizer, req.messages)
-
-    created = int(time.time())
     rid = f"chatcmpl_{uuid.uuid4().hex[:24]}"
 
     # Try to load a real model unless echo is forced
@@ -56,6 +67,8 @@ async def chat_completions(req: ChatCompletionRequest):
 
     if bundle is None:
         # --- Echo backend (Post 1) ---
+        tokenizer = get_tokenizer(model_name)
+        prompt = render_messages(tokenizer, req.messages)
         input_ids = tokenizer.encode(prompt, add_special_tokens=False)
         max_new = max(0, int(req.max_tokens or 0)) or 128
         output_ids = input_ids[:max_new]
@@ -76,13 +89,18 @@ async def chat_completions(req: ChatCompletionRequest):
 
     # real model path (after bundle is loaded)
     tok = bundle.tokenizer
+    prompt = render_messages(tok, req.messages)
+    eot = tok.convert_tokens_to_ids("<|eot_id|>")
     eos = tok.eos_token_id
+    eos_ids = [i for i in (eot, eos) if i is not None]
     enc = tok(prompt, return_tensors="pt", add_special_tokens=False)
     input_ids = enc["input_ids"].to(bundle.device)
 
+    outq: asyncio.Queue = asyncio.Queue()
+
     # sampler config
     cfg = SamplerCfg(
-        temperature=float(req.temperature or 1.0),
+        temperature=float(req.temperature if req.temperature is not None else 1.0),
         top_p=float(req.top_p or 1.0),
         top_k=int(req.top_k) if req.top_k else None,
         presence_penalty=float(req.presence_penalty or 0.0),
@@ -97,63 +115,40 @@ async def chat_completions(req: ChatCompletionRequest):
         gen = torch.Generator(device=bundle.device.type)
         gen.manual_seed(int(req.seed))
 
+    greq = GenRequest(
+        model_name=req.model,
+        prompt=prompt,
+        tok=tok,
+        max_new=int(req.max_tokens or 16),
+        cfg=cfg,
+        eos_ids=eos_ids,
+        seed=req.seed,
+        outq=outq,
+    )
+    await SCHED.submit(greq)
+
     if req.stream:
-        async def stream() -> AsyncGenerator[bytes, None]:
-            yield _sse_chunk(rid, model_name, role="assistant")
-            generated = input_ids
-            # prefill once
-            logits, kv = prefill(bundle.model, input_ids)
-            for _ in range(max_new):
-                next_ids, chosen_lp, logprobs = sample_next(logits, cfg, generated, gen)
-                generated = torch.cat([generated, next_ids.unsqueeze(1)], dim=1)
-                piece = tok.decode(next_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                # emit SSE chunk (with optional logprobs)
-                extra = None
-                if req.logprobs:
-                    k = int(req.top_logprobs or 0)
-                    content = [{
-                        "token": piece,
-                        "bytes": list(piece.encode("utf-8", errors="ignore")),
-                        "logprob": float(chosen_lp[0]),
-                        "top_logprobs": (
-                            [{"token": tok.decode([int(i)], skip_special_tokens=True, clean_up_tokenization_spaces=False),
-                               "logprob": float(v)} for v, i in zip(*torch.topk(logprobs[0], k))]
-                            if k > 0 else []
-                        ),
-                    }]
-                    extra = {"logprobs": {"content": content}}
-                yield _sse_chunk(rid, model_name, content=piece, extra=extra)
-                if eos is not None and int(next_ids[0]) == eos:
+        async def stream():
+            yield _sse_chunk(rid, req.model, role="assistant")
+            while True:
+                piece = await outq.get()
+                if piece is None:
                     break
-                # fast decode step
-                logits, kv = decode_step(bundle.model, next_ids.view(1,1), kv)
-                await asyncio.sleep(0.0)
-            yield _sse_done(rid, model_name)
+                yield _sse_chunk(rid, req.model, content=piece)
+            yield _sse_done(rid, req.model)
         return StreamingResponse(stream(), media_type="text/event-stream")
 
     # in non‑stream path
-    all_ids, per_step = cached_generate(
-        bundle.model, input_ids, max_new_tokens=max_new, eos_token_id=eos,
-        cfg=cfg, gen=gen, collect_logprobs=bool(req.logprobs)
-    )
-    new_ids = all_ids[0, input_ids.size(1):]
-    text = tok.decode(new_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-
-    payload = _non_stream_payload(rid, model_name, text)
-    if req.logprobs:
-        tokens = []
-        for step in per_step:
-            item = step[0]
-            tstr = tok.decode([item["id"]], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            toks = {"token": tstr, "bytes": list(tstr.encode("utf-8", errors="ignore")), "logprob": item["logprob"]}
-            if cfg.top_logprobs:
-                toks["top_logprobs"] = [
-                    {"token": tok.decode([tid], skip_special_tokens=True, clean_up_tokenization_spaces=False), "logprob": (lp if str(math.fabs(lp)) != "inf" else str(lp))}
-                    for (tid, lp) in item.get("top_logprobs", [])
-                ]
-            tokens.append(toks)
-        payload["logprobs"] = {"content": tokens}
-    return JSONResponse(payload)
+    # non‑stream: collect everything
+    while True:
+        piece = await outq.get()
+        if piece is None:
+            break
+    # Decode from token IDs like HF does
+    prefix_len = greq.input_ids.size(1) if greq.input_ids is not None else 0
+    gen_ids = greq.generated[0, prefix_len:]
+    text = tok.decode(gen_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+    return JSONResponse(_non_stream_payload(rid, req.model, text))
 
 
 # helpers ------------------------------------------------------------
