@@ -34,11 +34,12 @@ DEFAULT_DEVICE = os.getenv("MYSERVE_DEVICE", "auto")
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
-    prompt = render_messages(req.messages)
+    model_name = req.model
+    tokenizer = get_tokenizer(model_name)
+    prompt = render_messages(tokenizer, req.messages)
 
     created = int(time.time())
     rid = f"chatcmpl_{uuid.uuid4().hex[:24]}"
-    model_name = req.model
 
     # Try to load a real model unless echo is forced
     bundle = None
@@ -51,7 +52,6 @@ async def chat_completions(req: ChatCompletionRequest):
 
     if bundle is None:
         # --- Echo backend (Post 1) ---
-        tokenizer = get_tokenizer(model_name)
         input_ids = tokenizer.encode(prompt, add_special_tokens=False)
         max_new = max(0, int(req.max_tokens or 0)) or 128
         output_ids = input_ids[:max_new]
