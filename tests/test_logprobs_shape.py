@@ -9,7 +9,6 @@ async def started_app():
     async with LifespanManager(app):
         yield app
 
-@pytest.mark.skip(reason="doesn't work with new scheduler")
 @pytest.mark.asyncio
 async def test_logprobs_shape(started_app):
     body = {

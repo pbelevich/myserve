@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio, time, uuid
 from dataclasses import dataclass, field
-from typing import List, Optional, Deque, Tuple
+from typing import List, Optional, Deque, Tuple, Union
 from collections import deque
 import torch
 from transformers import DynamicCache
@@ -31,6 +31,8 @@ class GenRequest:
     kv: Optional[KVCache] = None
     done: bool = False
     first_token_s: Optional[float] = None
+    want_logprobs: bool = False
+    top_logprobs: int = 0
 
 def _handle_prefill_req(prefill_batch: List[GenRequest], r: GenRequest) -> None:
     bundle = REGISTRY.load(r.model_name)
@@ -70,16 +72,49 @@ def _handle_decode_batch(batch: List[GenRequest]) -> Tuple[torch.Tensor, Past, t
 
     return _handle_batch_common(bundle.model, input_ids, past_key_values, attention_mask, position_ids, lengths)
 
-def _handle_out(r: GenRequest, logits: torch.Tensor, past) -> None:
+def _handle_out(r: GenRequest, logits: torch.Tensor, past) -> Tuple[torch.Tensor, Union[str, dict]]:
     bundle = REGISTRY.load(r.model_name)
     next_ids, chosen_lp, logprobs = sample_next(
         logits, r.cfg, r.generated, _make_gen(bundle.device, r.seed)
     )
+
+    # update request state
     r.generated = torch.cat([r.generated, next_ids.view(1, 1)], dim=1)
     r.kv = KVCache.from_past(past)
+
+    # text piece
     piece = r.tok.decode(next_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+
+    # default payload is just the text
+    payload: Union[str, dict] = piece
+
+    # optional logprobs
+    if r.want_logprobs:
+        k = max(0, int(r.top_logprobs or 0))
+        tops = []
+        if k > 0:
+            topv, topi = torch.topk(logprobs[0], k)
+            tops = [
+                {
+                    "token": r.tok.decode([int(i)], skip_special_tokens=True, clean_up_tokenization_spaces=False),
+                    "logprob": float(v),
+                }
+                for v, i in zip(topv.tolist(), topi.tolist())
+            ]
+        payload = {
+            "piece": piece,
+            "logprobs": {
+                "content": [{
+                    "token": piece,
+                    "bytes": list(piece.encode("utf-8", errors="ignore")),
+                    "logprob": float(chosen_lp[0]),
+                    "top_logprobs": tops,
+                }]
+            },
+        }
+
     TOKENS_TOTAL.labels(model=r.model_name).inc()
-    return next_ids, piece
+    return next_ids, payload
 
 class Scheduler:
     def __init__(self, device: str = "auto", prefill_bs: int = 4, decode_bs: int = 8):
@@ -131,7 +166,7 @@ class Scheduler:
                 # sample one token for each request
                 for i, r in enumerate(prefill_batch):
                     split = split_past(tuple((K[i:i+1], V[i:i+1]) for (K, V) in past), lengths[i:i+1])
-                    next_ids, piece = _handle_out(
+                    next_ids, payload = _handle_out(
                         r, 
                         logits[i:i+1, :], 
                         split[0], 
@@ -139,7 +174,7 @@ class Scheduler:
                     if r.first_token_s is None:
                         r.first_token_s = time.time()
                         TTFT_HIST.labels(model=r.model_name).observe(r.first_token_s - r.created_s)
-                    await r.outq.put(piece)
+                    await r.outq.put(payload)
                     if r.eos_ids and int(next_ids[0]) in r.eos_ids:
                         r.done = True
 
@@ -153,12 +188,12 @@ class Scheduler:
 
                 for i, r in enumerate(decode_batch):
                     split = split_past(tuple((K[i:i+1], V[i:i+1]) for (K, V) in past), lengths[i:i+1])
-                    next_ids, piece = _handle_out(
+                    next_ids, payload = _handle_out(
                         r, 
                         logits[i:i+1, :], 
                         split[0],
                     )
-                    await r.outq.put(piece)
+                    await r.outq.put(payload)
                     if r.generated.size(1) - r.input_ids.size(1) >= r.max_new:
                         r.done = True
                     if r.eos_ids and int(next_ids[0]) in r.eos_ids:

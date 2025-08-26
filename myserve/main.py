@@ -124,6 +124,8 @@ async def chat_completions(req: ChatCompletionRequest):
         eos_ids=eos_ids,
         seed=req.seed,
         outq=outq,
+        want_logprobs=bool(req.logprobs),
+        top_logprobs=int(req.top_logprobs or 0),
     )
     await SCHED.submit(greq)
 
@@ -131,24 +133,37 @@ async def chat_completions(req: ChatCompletionRequest):
         async def stream():
             yield _sse_chunk(rid, req.model, role="assistant")
             while True:
-                piece = await outq.get()
-                if piece is None:
+                item = await outq.get()
+                if item is None:
                     break
-                yield _sse_chunk(rid, req.model, content=piece)
+                if isinstance(item, dict):  # contains piece + logprobs
+                    yield _sse_chunk(
+                        rid, req.model,
+                        content=item["piece"],
+                        extra={"logprobs": item["logprobs"]}
+                    )
+                else:
+                    yield _sse_chunk(rid, req.model, content=item)
             yield _sse_done(rid, req.model)
         return StreamingResponse(stream(), media_type="text/event-stream")
 
-    # in non‑stream path
-    # non‑stream: collect everything
+    logprob_tokens = []
     while True:
-        piece = await outq.get()
-        if piece is None:
+        item = await outq.get()
+        if item is None:
             break
-    # Decode from token IDs like HF does
+        if isinstance(item, dict):
+            logprob_tokens.extend(item["logprobs"]["content"])
+
+    # Build final text from token IDs (robust w/ BPE)
     prefix_len = greq.input_ids.size(1) if greq.input_ids is not None else 0
     gen_ids = greq.generated[0, prefix_len:]
     text = tok.decode(gen_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    return JSONResponse(_non_stream_payload(rid, req.model, text))
+
+    payload = _non_stream_payload(rid, req.model, text)
+    if req.logprobs:
+        payload["logprobs"] = {"content": logprob_tokens}
+    return JSONResponse(payload)
 
 
 # helpers ------------------------------------------------------------
