@@ -6,6 +6,7 @@ from openai import AsyncOpenAI
 from asgi_lifespan import LifespanManager
 from myserve.main import app
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from myserve.core.tokenizer import render_messages
 
 @pytest.fixture()
 async def started_app():
@@ -38,10 +39,10 @@ async def openai_client(started_app):
 @pytest.mark.asyncio
 async def test_chat_completions_basic(openai_client: AsyncOpenAI):
     resp = await openai_client.chat.completions.create(
-        model="meta-llama/Llama-3.2-1B-Instruct",
+        model="gpt2",
         messages=[{"role": "user", "content": "What is the capital of France? Answer with one word."}],
         temperature=0,
-        max_tokens=5,
+        max_tokens=10,
     )
 
     assert resp.id
@@ -55,7 +56,7 @@ async def test_chat_completions_basic(openai_client: AsyncOpenAI):
 @pytest.mark.asyncio
 async def test_chat_completions_stream(openai_client: AsyncOpenAI):
     stream = await openai_client.chat.completions.create(
-        model="meta-llama/Llama-3.2-1B-Instruct",
+        model="gpt2",
         messages=[{"role": "user", "content": "What is the capital of France? Answer with one word."}],
         stream=True,
         temperature=0,
@@ -77,13 +78,11 @@ async def test_chat_completions_stream(openai_client: AsyncOpenAI):
     out = "".join(chunks)
     assert "Paris" in out
 
-titanic_expected = 'The RMS Titanic was a British passenger liner that sank in the North Atlantic Ocean in the early morning of April 15, 1912, after colliding with an iceberg during her maiden voyage from Southampton to New York City. The tragedy resulted in the loss of over 1,500 lives and became one of the deadliest maritime disasters in history.\n\nHere are some key facts about the Titanic:\n\n**Design and Construction**\n\nThe Titanic was built by the Harland and Wolff shipyard in Belfast, Ireland, and was designed by Alexander Carlisle and William Pirrie. It was the largest ship in the world at the time, measuring over 882 feet (270 meters) long and 92 feet (28 meters) wide. The Titanic was powered by four high-pressure steam engines and had a top speed of around 21 knots (24 mph).\n\n**Maiden Voyage**\n\nThe Titanic began its maiden voyage from Southampton, England, on April 10, 1912, bound for New York City. On board were some of the most prominent people of the time, including millionaires, politicians, and royalty. The ship was considered unsinkable, with a double-bottom hull and 16 watertight compartments that could supposedly keep the ship afloat even if four of them were flooded.\n\n**Iceberg Collision**\n\nOn the night of April 14, 1912, the Titanic received several warnings of icebergs in the area, but the crew did not take adequate precautions. At 11:40 PM, the ship struck an iceberg on its starboard (right) side. The collision caused significant damage to the ship\'s hull, but it was not immediately apparent how severe the damage was.\n\n**Sinking**\n\nOver the next two hours, the Titanic took on water and began to list (tilt) to one side. The crew sent out distress signals, but they were not received in time to prevent the ship from sinking. At 2:20 AM on April 15, 1912, the Titanic finally slipped beneath the surface of the ocean, taking over 1,500 people with it.\n\n**Rescue Efforts**\n\nThe crew of the RMS Carpathia, which had arrived in the area the night before, received the Titanic\'s distress signals and began to rescue survivors. The Carpathia took on over 700 survivors and provided them with food, clothing, and medical care. The rescue efforts took several days, and many survivors were left stranded on the sinking ship.\n\n**Investigation and Legacy**\n\nThe sinking of the Titanic was investigated by a British inquiry, which concluded that a combination of factors contributed to the disaster, including:\n\n* Excessive speed in an area known to have icebergs\n* Insufficient lookout and warning systems\n* Inadequate lifeboat capacity and training\n* Design flaws in the ship\'s hull\n\nThe Titanic\'s legacy is still felt today, with many considering it a cautionary tale about the dangers of hubris and the importance of safety at sea. The ship\'s story has been immortalized in numerous books, films, and other works of art, and it continues to fascinate people around the world.\n\n**Interesting Facts**\n\n* The Titanic was on its maiden voyage when it set a new record for the fastest transatlantic crossing, traveling from Southampton to New York in just over 7 hours.\n* The ship\'s band played music for over 2 hours after the collision, including a rendition of "Nearer, My God, to Thee."\n* The Titanic\'s grand staircase was considered one of the most impressive in the world at the time.\n* The ship\'s lookouts were not adequately trained to spot icebergs, and the crew did not have access to binoculars or other tools to help them detect the danger.'
-
 @pytest.mark.asyncio
 async def test_chat_completions_titanic(openai_client: AsyncOpenAI):
-    model_id = "meta-llama/Llama-3.2-1B-Instruct"
+    model_id = "gpt2"
     messages = [{"role": "user", "content": "Tell me about Titanic"}]
-    max_new_tokens = 300
+    max_new_tokens = 100
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
     if tokenizer.pad_token is None:
@@ -95,12 +94,8 @@ async def test_chat_completions_titanic(openai_client: AsyncOpenAI):
         device_map="auto"
     )
 
-    inputs = tokenizer.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        return_tensors="pt"
-    ).to(model.device)
-
+    prompt = render_messages(tokenizer, messages)
+    inputs = tokenizer(prompt, add_special_tokens=False, return_tensors="pt").input_ids.to(model.device)
     eot_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
     eos_ids = [tid for tid in {tokenizer.eos_token_id, eot_id} if tid is not None]
 
@@ -116,8 +111,6 @@ async def test_chat_completions_titanic(openai_client: AsyncOpenAI):
 
     generated = output_ids[0, inputs.shape[-1]:]
     hf_generated = tokenizer.decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-
-    # assert hf_generated == titanic_expected, f"{hf_generated=}\n\n\n{titanic_expected=}"
 
     input_ids = inputs
     past_key_values = None

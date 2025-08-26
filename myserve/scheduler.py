@@ -1,7 +1,7 @@
 from __future__ import annotations
 import asyncio, time, uuid
 from dataclasses import dataclass, field
-from typing import List, Optional, Deque
+from typing import List, Optional, Deque, Tuple
 from collections import deque
 import torch
 from transformers import DynamicCache
@@ -9,7 +9,7 @@ from transformers import DynamicCache
 from .core.models import REGISTRY
 from .core.kv import KVCache
 from .core.sampling import SamplerCfg, sample_next
-from .core.collate import pad_past, split_past, pad_sequences
+from .core.collate import pad_past, split_past, pad_sequences, Past
 from .metrics import REQ_TOTAL, TOKENS_TOTAL, TTFT_HIST
 
 @dataclass
@@ -52,7 +52,7 @@ def _handle_batch_common(model, input_ids, past_key_values, attention_mask, posi
     new_past = out.past_key_values
     return logits, new_past, lengths
 
-def _handle_prefill_batch(prefill_batch: List[GenRequest]) -> None:
+def _handle_prefill_batch(prefill_batch: List[GenRequest]) -> Tuple[torch.Tensor, Past, torch.Tensor]:
     bundle = REGISTRY.load(prefill_batch[0].model_name)
 
     input_ids, attention_mask, position_ids, lengths = pad_sequences([r.input_ids.squeeze(0) for r in prefill_batch], prefill_batch[0].tok.pad_token_id)
@@ -60,7 +60,7 @@ def _handle_prefill_batch(prefill_batch: List[GenRequest]) -> None:
 
     return _handle_batch_common(bundle.model, input_ids, past_key_values, attention_mask, position_ids, lengths)
 
-def _handle_decode_batch(batch: List[GenRequest]) -> None:
+def _handle_decode_batch(batch: List[GenRequest]) -> Tuple[torch.Tensor, Past, torch.Tensor]:
     bundle = REGISTRY.load(batch[0].model_name)
 
     input_ids = torch.cat([r.generated[:, -1:] for r in batch], dim=0)  # [B,1]

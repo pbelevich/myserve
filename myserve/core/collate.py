@@ -7,7 +7,7 @@ from torch.nn.utils.rnn import pad_sequence
 Past = Tuple[Tuple[torch.Tensor, torch.Tensor], ...]
 
 def pad_past(pasts: List[Past]) -> Tuple[Past, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pad a list of ast_kv to a common T_max.
+    """Pad a list of past_kv to a common T_max.
     Returns: (padded_past, lengths[B], attention_mask[B, T_max+1], position_ids[B,1])
     """
     L = len(pasts[0])
@@ -17,7 +17,6 @@ def pad_past(pasts: List[Past]) -> Tuple[Past, torch.Tensor, torch.Tensor, torch
 
     padded: List[Tuple[torch.Tensor, torch.Tensor]] = []
     device = pasts[0][0][0].device
-    dtype = pasts[0][0][0].dtype
 
     for layer in range(L):
         ks = []
@@ -63,7 +62,7 @@ def split_past(padded: Past, lengths: torch.Tensor) -> List[Past]:
         out.append(tuple(layers))
     return out
 
-def pad_sequences(input_ids: List[torch.Tensor], pad_token_id: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def pad_sequences(input_ids: List[torch.Tensor], pad_token_id: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     inputs_ids = pad_sequence(input_ids, batch_first=True, padding_value=pad_token_id, padding_side="left")
     lengths = torch.tensor([len(s) for s in input_ids], device=inputs_ids.device)  # [B]
     max_len = int(lengths.max())

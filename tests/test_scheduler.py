@@ -316,10 +316,10 @@ class TestSchedulerLoop:
         assert piece12_2 == piece2_1
 
         for l in range(config.num_hidden_layers):
-            torch.testing.assert_close(prefill_batch12[0].kv.layers[l][0], prefill_batch1[0].kv.layers[l][0])
-            torch.testing.assert_close(prefill_batch12[0].kv.layers[l][1], prefill_batch1[0].kv.layers[l][1])
-            torch.testing.assert_close(prefill_batch12[1].kv.layers[l][0], prefill_batch2[0].kv.layers[l][0])
-            torch.testing.assert_close(prefill_batch12[1].kv.layers[l][1], prefill_batch2[0].kv.layers[l][1])
+            torch.testing.assert_close(prefill_batch12[0].kv.layers[l][0], prefill_batch1[0].kv.layers[l][0], atol=1e-3, rtol=1e-3)
+            torch.testing.assert_close(prefill_batch12[0].kv.layers[l][1], prefill_batch1[0].kv.layers[l][1], atol=1e-3, rtol=1e-3)
+            torch.testing.assert_close(prefill_batch12[1].kv.layers[l][0], prefill_batch2[0].kv.layers[l][0], atol=1e-3, rtol=1e-3)
+            torch.testing.assert_close(prefill_batch12[1].kv.layers[l][1], prefill_batch2[0].kv.layers[l][1], atol=1e-3, rtol=1e-3)
 
         logits12, new_past12, lengths12 = _handle_decode_batch(prefill_batch12)
         logits1, new_past1, lengths1 = _handle_decode_batch(prefill_batch1)

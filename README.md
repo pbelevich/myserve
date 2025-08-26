@@ -17,14 +17,30 @@ pytest
 uvicorn myserve.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+## Send sample request
 ```bash
 curl -s http://${HOST}:${PORT}/v1/chat/completions   -H "Content-Type: application/json"   -d '{
-    "model": "meta-llama/Meta-Llama-3-8B-Instruct",
+    "model": "meta-llama/Llama-3.2-1B-Instruct",
     "messages": [
       {
         "role": "user",
-        "content": "Hi"
+        "content": "What is the capital of France?"
       }
     ]
   }' | jq
   ```
+
+## Benchmark
+
+```
+pip install sglang
+```
+
+```bash
+python -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --base-url http://${HOST}:${PORT} \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --dataset-name random --num-prompts 10 \
+  --random-input 128 --random-output 128
+```

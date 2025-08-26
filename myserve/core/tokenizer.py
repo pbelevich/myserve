@@ -27,11 +27,11 @@ def render_messages(tok: AutoTokenizer, messages: Iterable):
         """
         parts = []
         for m in messages:
-            if m.role == "system":
-                parts.append(m.content.strip())
-            elif m.role == "user":
-                parts.append(m.content.strip())
-            elif m.role == "assistant":
-                parts.append(m.content.strip())
+            if m.role == "system" if hasattr(m, "role") else m["role"] == "system":
+                parts.append(m.content.strip() if hasattr(m, "content") else m["content"].strip())
+            elif m.role == "user" if hasattr(m, "role") else m["role"] == "user":
+                parts.append(m.content.strip() if hasattr(m, "content") else m["content"].strip())
+            elif m.role == "assistant" if hasattr(m, "role") else m["role"] == "assistant":
+                parts.append(m.content.strip() if hasattr(m, "content") else m["content"].strip())
             # tool messages ignored in post #1
         return "\n".join(p for p in parts if p).strip()
