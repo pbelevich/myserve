@@ -10,7 +10,8 @@ from .core.models import REGISTRY
 from .core.kv import KVCache
 from .core.sampling import SamplerCfg, sample_next
 from .core.collate import pad_past, split_past, pad_sequences, Past
-from .metrics import REQ_TOTAL, TOKENS_TOTAL, TTFT_HIST
+from .core.memory import MemManager, _free_bytes
+from .metrics import REQ_TOTAL, TOKENS_TOTAL, TTFT_HIST, MEM_RESERVED_BYTES, MEM_FREE_BYTES
 
 @dataclass
 class GenRequest:
@@ -42,6 +43,7 @@ def _handle_prefill_req(prefill_batch: List[GenRequest], r: GenRequest) -> None:
     r.kv = None
     prefill_batch.append(r)
 
+@torch.inference_mode()
 def _handle_batch_common(model, input_ids, past_key_values, attention_mask, position_ids, lengths):
     out = model(
         input_ids=input_ids,
@@ -124,6 +126,35 @@ class Scheduler:
         self._ingress: asyncio.Queue[GenRequest] = asyncio.Queue()
         self._active: Deque[GenRequest] = deque()
         self._task: Optional[asyncio.Task] = None
+        self._mem: dict[str, MemManager] = {}
+        self._waiting: Deque[GenRequest] = deque()
+
+    def _get_mem(self, model_name: str) -> MemManager:
+        if model_name in self._mem:
+            return self._mem[model_name]
+        bundle = REGISTRY.load(model_name)  # cfg/dtype/device from the actual model
+        mm = MemManager(model_name=model_name, device=bundle.device, cfg=bundle.model.config, dtype=bundle.model.dtype)
+        self._mem[model_name] = mm
+        return mm
+
+    def _try_admit_prefill(self, r: GenRequest, prefill_batch: List[GenRequest]) -> bool:
+        bundle = REGISTRY.load(r.model_name)
+        enc = r.tok(r.prompt, return_tensors="pt", add_special_tokens=False)
+        r.input_ids = enc["input_ids"].to(bundle.device)
+        r.generated = r.input_ids
+        r.kv = None
+
+        mm = self._get_mem(r.model_name)
+        prompt_len = int(r.input_ids.size(1))
+        if not mm.reserve(r.id, prompt_len, r.max_new):
+            # not enough memory → leave it for later
+            return False
+
+        MEM_RESERVED_BYTES.labels(model=r.model_name).set(mm.reserved_bytes())
+        MEM_FREE_BYTES.set(_free_bytes(mm.device))
+        prefill_batch.append(r)
+        self._active.append(r)
+        return True
 
     async def start(self):
         if self._task is None:
@@ -155,10 +186,19 @@ class Scheduler:
             tick += 1
             # 1) admit NEW → PREFILL batch
             prefill_batch: List[GenRequest] = []
+
+            # first, try from the waiting list
+            while len(prefill_batch) < self.prefill_bs and self._waiting:
+                r = self._waiting[0]
+                if self._try_admit_prefill(r, prefill_batch):
+                    self._waiting.popleft()
+                else:
+                    break  # still no memory; keep waiting
+
             while len(prefill_batch) < self.prefill_bs and not self._ingress.empty():
                 r = await self._ingress.get()
-                _handle_prefill_req(prefill_batch, r)
-                self._active.append(r)
+                if not self._try_admit_prefill(r, prefill_batch):
+                    self._waiting.append(r)  # park it until memory frees
 
             if prefill_batch:
                 logits, past, lengths = _handle_prefill_batch(prefill_batch)
@@ -202,7 +242,12 @@ class Scheduler:
             # 3) retire completed requests
             while self._active and self._active[0].done:
                 r = self._active.popleft()
-                await r.outq.put(None)  # sentinel for DONE
+                # release reservation
+                mm = self._get_mem(r.model_name)
+                mm.release(r.id)
+                MEM_RESERVED_BYTES.labels(model=r.model_name).set(mm.reserved_bytes())
+                MEM_FREE_BYTES.set(_free_bytes(mm.device))
+                await r.outq.put(None)
 
             # # 4) tiny sleep to yield
             await asyncio.sleep(0.0)

@@ -94,6 +94,13 @@ class FakeModel:
         self.H = num_heads
         self.D = head_dim
         self.calls: List[dict] = []  # record last calls for assertions
+        self.config = SimpleNamespace(
+            num_hidden_layers=num_layers,
+            num_attention_heads=num_heads,
+            hidden_size=head_dim,
+            n_head=num_heads,
+        )
+        self.dtype = torch.bfloat16
 
     def __call__(self, *, input_ids, attention_mask, past_key_values, position_ids, use_cache: bool):
         # Batch size

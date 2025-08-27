@@ -205,6 +205,13 @@ class TestSchedulerLoop:
                 return SimpleNamespace(logits=mock_logits, past_key_values=mock_past)
 
             mock_bundle.model.side_effect = model_fn
+            mock_bundle.model.config = SimpleNamespace(
+                num_hidden_layers=3,
+                num_attention_heads=12,
+                hidden_size=768,
+                n_head=12,
+            )
+            mock_bundle.dtype = torch.bfloat16
 
             r1_input_ids = self.tok("Hello", return_tensors="pt", add_special_tokens=False, padding=True, padding_side="left")["input_ids"]
             r2_input_ids = self.tok("Test 1 2 3", return_tensors="pt", add_special_tokens=False, padding=True, padding_side="left")["input_ids"]
