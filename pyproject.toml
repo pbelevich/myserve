@@ -22,7 +22,11 @@ dependencies = [
   "torch>=2.2",
   "openai>=1,<2",
   "asgi-lifespan",
-  "prometheus-client>=0.20"
+  "prometheus-client>=0.20",
+  "opentelemetry-api>=1.26",
+  "opentelemetry-sdk>=1.26",
+  "opentelemetry-exporter-otlp>=1.26",
+  "opentelemetry-instrumentation-fastapi>=0.47b0",
 ]
 
 [tool.pytest.ini_options]

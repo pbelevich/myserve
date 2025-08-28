@@ -1,0 +1,61 @@
+{
+    "title": "myserve — Overview",
+    "panels": [
+        {
+            "type": "timeseries",
+            "title": "Requests per second",
+            "targets": [{"expr": "sum(rate(myserve_requests_total[1m]))"}]
+        },
+        {
+            "type": "timeseries",
+            "title": "Tokens per second",
+            "targets": [{"expr": "sum(rate(myserve_tokens_total[1m]))"}]
+        },
+        {
+            "type": "stat",
+            "title": "Inflight",
+            "targets": [{"expr": "sum(myserve_inflight_requests)"}]
+        },
+        {
+            "type": "stat",
+            "title": "Queue depth",
+            "targets": [{"expr": "myserve_queue_depth"}]
+        },
+        {
+            "type": "timeseries",
+            "title": "TTFT p50/p95 (s)",
+            "targets": [
+                {"expr": "histogram_quantile(0.5, sum(rate(myserve_ttft_seconds_bucket[5m])) by (le))"},
+                {"expr": "histogram_quantile(0.95, sum(rate(myserve_ttft_seconds_bucket[5m])) by (le))"}
+            ]
+        },
+        {
+            "type": "timeseries",
+            "title": "Queue wait p50/p95 (s)",
+            "targets": [
+                {"expr": "histogram_quantile(0.5, sum(rate(myserve_queue_wait_seconds_bucket[5m])) by (le))"},
+                {"expr": "histogram_quantile(0.95, sum(rate(myserve_queue_wait_seconds_bucket[5m])) by (le))"}
+            ]
+        },
+        {
+            "type": "timeseries",
+            "title": "Prefill / Decode step (s)",
+            "targets": [
+                {"expr": "sum(rate(myserve_prefill_seconds_sum[1m])) / sum(rate(myserve_prefill_seconds_count[1m]))", "legendFormat": "prefill avg"},
+                {"expr": "sum(rate(myserve_decode_step_seconds_sum[1m])) / sum(rate(myserve_decode_step_seconds_count[1m]))", "legendFormat": "decode avg"}
+            ]
+        },
+        {
+            "type": "timeseries",
+            "title": "Batch sizes",
+            "targets": [
+                {"expr": "histogram_quantile(0.5, sum(rate(myserve_prefill_batch_size_bucket[5m])) by (le))", "legendFormat": "prefill p50"},
+                {"expr": "histogram_quantile(0.95, sum(rate(myserve_prefill_batch_size_bucket[5m])) by (le))", "legendFormat": "prefill p95"},
+                {"expr": "histogram_quantile(0.5, sum(rate(myserve_decode_batch_size_bucket[5m])) by (le))", "legendFormat": "decode p50"},
+                {"expr": "histogram_quantile(0.95, sum(rate(myserve_decode_batch_size_bucket[5m])) by (le))", "legendFormat": "decode p95"}
+            ]
+        }
+    ]
+}
+
+

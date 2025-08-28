@@ -3,6 +3,7 @@ import asyncio, time, uuid
 from dataclasses import dataclass, field
 from typing import List, Optional, Deque, Tuple, Union
 from collections import deque
+import time
 import torch
 from transformers import DynamicCache
 
@@ -11,7 +12,11 @@ from .core.kv import KVCache
 from .core.sampling import SamplerCfg, sample_next
 from .core.collate import pad_past, split_past, pad_sequences, Past
 from .core.memory import MemManager, _free_bytes
-from .metrics import REQ_TOTAL, TOKENS_TOTAL, TTFT_HIST, MEM_RESERVED_BYTES, MEM_FREE_BYTES
+from opentelemetry import trace
+from .metrics import (
+    REQ_TOTAL, TOKENS_TOTAL, TTFT_HIST, MEM_RESERVED_BYTES, MEM_FREE_BYTES, QUEUE_DEPTH, PREFILL_HIST, DECODE_STEP_HIST, 
+    PREFILL_BATCH_HIST, DECODE_BATCH_HIST, ACTIVE_PREFILL, ACTIVE_DECODE, QUEUE_WAIT_HIST, E2E_HIST,
+)
 
 @dataclass
 class GenRequest:
@@ -35,13 +40,12 @@ class GenRequest:
     want_logprobs: bool = False
     top_logprobs: int = 0
 
-def _handle_prefill_req(prefill_batch: List[GenRequest], r: GenRequest) -> None:
+def _handle_prefill_req(r: GenRequest) -> None:
     bundle = REGISTRY.load(r.model_name)
     enc = r.tok(r.prompt, return_tensors="pt", add_special_tokens=False)
     r.input_ids = enc["input_ids"].to(bundle.device)
     r.generated = r.input_ids
     r.kv = None
-    prefill_batch.append(r)
 
 @torch.inference_mode()
 def _handle_batch_common(model, input_ids, past_key_values, attention_mask, position_ids, lengths):
@@ -118,6 +122,8 @@ def _handle_out(r: GenRequest, logits: torch.Tensor, past) -> Tuple[torch.Tensor
     TOKENS_TOTAL.labels(model=r.model_name).inc()
     return next_ids, payload
 
+tracer = trace.get_tracer("myserve.scheduler")
+
 class Scheduler:
     def __init__(self, device: str = "auto", prefill_bs: int = 4, decode_bs: int = 8):
         self.device = device
@@ -138,12 +144,7 @@ class Scheduler:
         return mm
 
     def _try_admit_prefill(self, r: GenRequest, prefill_batch: List[GenRequest]) -> bool:
-        bundle = REGISTRY.load(r.model_name)
-        enc = r.tok(r.prompt, return_tensors="pt", add_special_tokens=False)
-        r.input_ids = enc["input_ids"].to(bundle.device)
-        r.generated = r.input_ids
-        r.kv = None
-
+        _handle_prefill_req(r)
         mm = self._get_mem(r.model_name)
         prompt_len = int(r.input_ids.size(1))
         if not mm.reserve(r.id, prompt_len, r.max_new):
@@ -152,6 +153,8 @@ class Scheduler:
 
         MEM_RESERVED_BYTES.labels(model=r.model_name).set(mm.reserved_bytes())
         MEM_FREE_BYTES.set(_free_bytes(mm.device))
+        QUEUE_DEPTH.set(self._ingress.qsize())
+        QUEUE_WAIT_HIST.labels(model=r.model_name).observe(time.time() - r.created_s)
         prefill_batch.append(r)
         self._active.append(r)
         return True
@@ -178,6 +181,7 @@ class Scheduler:
     async def submit(self, req: GenRequest):
         REQ_TOTAL.labels(model=req.model_name).inc()
         await self._ingress.put(req)
+        QUEUE_DEPTH.set(self._ingress.qsize())
 
     @torch.inference_mode()
     async def _loop(self):
@@ -201,7 +205,13 @@ class Scheduler:
                     self._waiting.append(r)  # park it until memory frees
 
             if prefill_batch:
-                logits, past, lengths = _handle_prefill_batch(prefill_batch)
+                model_name = prefill_batch[0].model_name
+                ACTIVE_PREFILL.labels(model=model_name).set(len(prefill_batch))
+                PREFILL_BATCH_HIST.labels(model=model_name).observe(len(prefill_batch))
+                t0 = time.perf_counter()
+                with tracer.start_as_current_span("prefill_batch", attributes={"model": model_name, "size": len(prefill_batch)}):
+                    logits, past, lengths = _handle_prefill_batch(prefill_batch)
+                PREFILL_HIST.labels(model=model_name).observe(time.perf_counter() - t0)
 
                 # sample one token for each request
                 for i, r in enumerate(prefill_batch):
@@ -224,8 +234,13 @@ class Scheduler:
                 # rotate for fairness
                 self._active.rotate(1)
                 decode_batch = decode_candidates[: self.decode_bs]
-                logits, past, lengths = _handle_decode_batch(decode_batch)
-
+                model_name = decode_batch[0].model_name
+                ACTIVE_DECODE.labels(model=model_name).set(len(decode_batch))
+                DECODE_BATCH_HIST.labels(model=model_name).observe(len(decode_batch))
+                t0 = time.perf_counter()
+                with tracer.start_as_current_span("decode_batch", attributes={"model": model_name, "size": len(decode_batch)}):
+                    logits, past, lengths = _handle_decode_batch(decode_batch)
+                DECODE_STEP_HIST.labels(model=model_name).observe(time.perf_counter() - t0)
                 for i, r in enumerate(decode_batch):
                     split = split_past(tuple((K[i:i+1], V[i:i+1]) for (K, V) in past), lengths[i:i+1])
                     next_ids, payload = _handle_out(
@@ -247,6 +262,7 @@ class Scheduler:
                 mm.release(r.id)
                 MEM_RESERVED_BYTES.labels(model=r.model_name).set(mm.reserved_bytes())
                 MEM_FREE_BYTES.set(_free_bytes(mm.device))
+                E2E_HIST.labels(model=r.model_name).observe(time.time() - r.created_s)
                 await r.outq.put(None)
 
             # # 4) tiny sleep to yield

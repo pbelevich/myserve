@@ -148,6 +148,9 @@ class TestScheduler:
             mock_req_total.labels.assert_called_once_with(model="test-model")
             mock_req_total.labels.return_value.inc.assert_called_once()
 
+def _handle_prefill_req_and_add_to_batch(prefill_batch: List[GenRequest], r: GenRequest) -> None:
+    _handle_prefill_req(r)
+    prefill_batch.append(r)
 
 class TestSchedulerLoop:
     """Test the scheduler main loop functionality"""
@@ -278,16 +281,16 @@ class TestSchedulerLoop:
         config = AutoConfig.from_pretrained(model)
         
         prefill_batch12: List[GenRequest] = []
-        _handle_prefill_req(prefill_batch12, self.sample_request("Hello", model))
-        _handle_prefill_req(prefill_batch12, self.sample_request("Test 1 2 3", model))
+        _handle_prefill_req_and_add_to_batch(prefill_batch12, self.sample_request("Hello", model))
+        _handle_prefill_req_and_add_to_batch(prefill_batch12, self.sample_request("Test 1 2 3", model))
         logits12, past12, lengths12 = _handle_prefill_batch(prefill_batch12)
 
         prefill_batch1: List[GenRequest] = []
-        _handle_prefill_req(prefill_batch1, self.sample_request("Hello", model))
+        _handle_prefill_req_and_add_to_batch(prefill_batch1, self.sample_request("Hello", model))
         logits1, past1, lengths1 = _handle_prefill_batch(prefill_batch1)
         
         prefill_batch2: List[GenRequest] = []
-        _handle_prefill_req(prefill_batch2, self.sample_request("Test 1 2 3", model))
+        _handle_prefill_req_and_add_to_batch(prefill_batch2, self.sample_request("Test 1 2 3", model))
         logits2, past2, lengths2 = _handle_prefill_batch(prefill_batch2)
 
         torch.testing.assert_close(lengths12.cpu(), torch.tensor([1, 4], dtype=torch.long))
