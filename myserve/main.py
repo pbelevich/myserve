@@ -2,8 +2,6 @@ import asyncio
 import json
 import time
 import uuid
-import os
-from typing import AsyncGenerator
 
 import torch
 from fastapi import FastAPI
@@ -11,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
 
 from myserve.api.openai_types import ChatCompletionRequest
-from myserve.core.tokenizer import get_tokenizer, render_messages
+from myserve.core.tokenizer import render_messages
 from myserve.core.models import REGISTRY
 from myserve.core.sampling import SamplerCfg
 from myserve.scheduler import Scheduler, GenRequest
@@ -23,7 +21,7 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 tracer = None
 
-SCHED = Scheduler()
+SCHED = Scheduler(prefill_bs=16, decode_bs=32)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -53,10 +51,6 @@ def healthz():
 def metrics():
     return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-USE_ECHO_FALLBACK = os.getenv("MYSERVE_FORCE_ECHO", "0") == "1"
-DEFAULT_DTYPE = os.getenv("MYSERVE_DTYPE", "auto")
-DEFAULT_DEVICE = os.getenv("MYSERVE_DEVICE", "auto")
-
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
     model_name = req.model
@@ -65,35 +59,7 @@ async def chat_completions(req: ChatCompletionRequest):
         rid = f"chatcmpl_{uuid.uuid4().hex[:24]}"
 
         # Try to load a real model unless echo is forced
-        bundle = None
-        if not USE_ECHO_FALLBACK:
-            try:
-                bundle = REGISTRY.load(model_name, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE)
-            except Exception as e:
-                # fallback silently to echo mode; in real servers you would surface a 400
-                bundle = None
-
-        if bundle is None:
-            # --- Echo backend (Post 1) ---
-            tokenizer = get_tokenizer(model_name)
-            prompt = render_messages(tokenizer, req.messages)
-            input_ids = tokenizer.encode(prompt, add_special_tokens=False)
-            max_new = max(0, int(req.max_tokens or 0)) or 128
-            output_ids = input_ids[:max_new]
-
-            if req.stream:
-                async def echo_stream() -> AsyncGenerator[bytes, None]:
-                    yield _sse_chunk(rid, model_name, role="assistant")
-                    for tid in output_ids:
-                        piece = tokenizer.decode([tid], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                        if piece:
-                            yield _sse_chunk(rid, model_name, content=piece)
-                        await asyncio.sleep(0.0)
-                    yield _sse_done(rid, model_name)
-                return StreamingResponse(echo_stream(), media_type="text/event-stream")
-
-            text = tokenizer.decode(output_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            return JSONResponse(_non_stream_payload(rid, model_name, text))
+        bundle  = REGISTRY.load(model_name)
 
         # real model path (after bundle is loaded)
         tok = bundle.tokenizer
@@ -102,7 +68,6 @@ async def chat_completions(req: ChatCompletionRequest):
         eos = tok.eos_token_id
         eos_ids = [i for i in (eot, eos) if i is not None]
         enc = tok(prompt, return_tensors="pt", add_special_tokens=False)
-        input_ids = enc["input_ids"].to(bundle.device)
 
         outq: asyncio.Queue = asyncio.Queue()
 

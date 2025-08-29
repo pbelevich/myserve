@@ -23,3 +23,4 @@ ACTIVE_DECODE = Gauge("myserve_active_decode", "Requests included in the last de
 # new memory gauges
 MEM_RESERVED_BYTES = Gauge("myserve_mem_reserved_bytes", "Bytes reserved for KV/workspace", ["model"])
 MEM_FREE_BYTES = Gauge("myserve_mem_free_bytes", "Approx free device bytes")  # no labels
+MODEL_BYTES = Gauge("myserve_model_bytes", "Approx model bytes in memory", ["model"])

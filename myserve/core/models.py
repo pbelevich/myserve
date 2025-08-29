@@ -4,6 +4,12 @@ from typing import Dict, Tuple
 import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from myserve.core.quant.convert import quantize_linears
+from myserve.core.quant.convert import approx_model_bytes
+from myserve.metrics import MODEL_BYTES
+
+DEFAULT_DTYPE = os.getenv("MYSERVE_DTYPE", "auto")
+DEFAULT_DEVICE = os.getenv("MYSERVE_DEVICE", "auto")
 
 @dataclass(frozen=True)
 class ModelBundle:
@@ -16,7 +22,7 @@ class ModelRegistry:
     def __init__(self):
         self._cache: Dict[Tuple[str, str, str], ModelBundle] = {}
 
-    def load(self, model_name: str, dtype: str = "auto", device: str = "auto") -> ModelBundle:
+    def load(self, model_name: str, dtype: str = DEFAULT_DTYPE, device: str = DEFAULT_DEVICE) -> ModelBundle:
         key = (model_name, dtype, device)
         if key in self._cache:
             return self._cache[key]
@@ -48,6 +54,14 @@ class ModelRegistry:
         )
         model.to(dev)
         model.eval()
+
+        # quantize (weight‑only)
+        if dtype.lower() in ("q8", "q4"):
+            act_dtype = model.dtype # torch.bfloat16 if torch_dtype in (torch.bfloat16, None) else torch.float16
+            quantize_linears(model, dtype.lower(), act_dtype)
+            print(f"Quantized model to {dtype.lower()} with act_dtype {act_dtype}")
+
+        MODEL_BYTES.labels(model=model_name).set(approx_model_bytes(model))
 
         bundle = ModelBundle(tokenizer=tok, model=model, device=dev, dtype=model.dtype)
         self._cache[key] = bundle
