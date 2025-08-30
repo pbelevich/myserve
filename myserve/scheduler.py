@@ -3,6 +3,8 @@ import asyncio, time, uuid
 from dataclasses import dataclass, field
 from typing import List, Optional, Deque, Tuple, Union
 from collections import deque
+import os
+from contextlib import contextmanager
 import time
 import torch
 from transformers import DynamicCache
@@ -17,6 +19,33 @@ from .metrics import (
     REQ_TOTAL, TOKENS_TOTAL, TTFT_HIST, MEM_RESERVED_BYTES, MEM_FREE_BYTES, QUEUE_DEPTH, PREFILL_HIST, DECODE_STEP_HIST, 
     PREFILL_BATCH_HIST, DECODE_BATCH_HIST, ACTIVE_PREFILL, ACTIVE_DECODE, QUEUE_WAIT_HIST, E2E_HIST,
 )
+
+try:
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+except Exception:
+    sdpa_kernel = None
+    SDPBackend = None
+
+_BACKEND_ALIASES = {
+    "flash": getattr(SDPBackend, "FLASH_ATTENTION", None),
+    "efficient": getattr(SDPBackend, "EFFICIENT_ATTENTION", None),
+    "math": getattr(SDPBackend, "MATH", None),
+    "cudnn": getattr(SDPBackend, "CUDNN_ATTENTION", None),
+}
+
+@contextmanager
+def maybe_sdpa_ctx():
+    spec = os.getenv("MYSERVE_SDPA_FORCE", "").strip().lower()
+    if not spec or sdpa_kernel is None:
+        yield
+        return
+    backends = [bk for name in spec.split(',') if (bk := _BACKEND_ALIASES.get(name)) is not None]
+    if not backends:
+        yield
+        return
+    # Highest priority first
+    with sdpa_kernel(backends, set_priority=True):
+        yield
 
 @dataclass
 class GenRequest:
@@ -49,13 +78,14 @@ def _handle_prefill_req(r: GenRequest) -> None:
 
 @torch.inference_mode()
 def _handle_batch_common(model, input_ids, past_key_values, attention_mask, position_ids, lengths):
-    out = model(
-        input_ids=input_ids,
-        past_key_values=past_key_values,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        use_cache=True,
-    )
+    with maybe_sdpa_ctx():
+        out = model(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=True,
+        )
     logits = out.logits[:, -1, :]
     new_past = out.past_key_values
     return logits, new_past, lengths

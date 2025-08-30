@@ -10,6 +10,7 @@ from myserve.metrics import MODEL_BYTES
 
 DEFAULT_DTYPE = os.getenv("MYSERVE_DTYPE", "auto")
 DEFAULT_DEVICE = os.getenv("MYSERVE_DEVICE", "auto")
+ATNN = os.getenv("MYSERVE_ATTN_IMPL", "sdpa").strip().lower()
 
 @dataclass(frozen=True)
 class ModelBundle:
@@ -23,7 +24,7 @@ class ModelRegistry:
         self._cache: Dict[Tuple[str, str, str], ModelBundle] = {}
 
     def load(self, model_name: str, dtype: str = DEFAULT_DTYPE, device: str = DEFAULT_DEVICE) -> ModelBundle:
-        key = (model_name, dtype, device)
+        key = (model_name, dtype, device, ATNN)
         if key in self._cache:
             return self._cache[key]
 
@@ -49,6 +50,7 @@ class ModelRegistry:
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch_dtype,
+            attn_implementation=ATNN,
             low_cpu_mem_usage=True,
             trust_remote_code=os.environ.get("TRUST_REMOTE_CODE", "0") == "1",
         )
